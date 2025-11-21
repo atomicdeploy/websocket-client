@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>WebSocket Client App</title>
+  <title>WebSocket Client</title>
   <meta name="color-scheme" content="dark light" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64' viewBox='0 0 24 24'%3E%3Cpath fill='%23fff' d='M5 3h14a2 2 0 0 1 2 2v14l-4-4H7a2 2 0 0 1-2-2z'/%3E%3C/svg%3E" />
   <style>
@@ -268,36 +268,7 @@
     .action:hover { border-color: rgba(124,58,237,.5); box-shadow: var(--ring); }
     .action .icon { opacity: .85; }
 
-    /* =============== TOOLS (Typing / Paragraph / Chart) =============== */
-    .tools { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-    @media (max-width: 1100px) { .tools { grid-template-columns: 1fr; } }
-
-    .typing {
-      display: grid; gap: 12px;
-    }
-    .paragraph {
-      padding: 12px; border: 1px dashed var(--border); border-radius: 12px;
-      background: linear-gradient(180deg, var(--bg-elev), var(--bg-elev-2));
-      font-family: var(--mono); font-size: 14px; line-height: 1.5;
-    }
-    .typefield {
-      padding: 12px; border-radius: 12px; border: 1px solid var(--border); min-height: 44px;
-      background: linear-gradient(180deg, #06080d, #0a0e15);
-      outline: none;
-    }
-    .typefield.error {
-      border-color: rgba(239,68,68,.7)!important; box-shadow: 0 0 0 2px rgba(239,68,68,.25)!important;
-    }
-    .stats {
-      display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px;
-    }
-    .stat {
-      display: grid; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 12px;
-      background: var(--bg-elev);
-    }
-    .stat__label { font-size: 12px; color: var(--muted); }
-    .stat__value { font-size: 18px; font-weight: 700; }
-
+    /* =============== COUNTDOWN EFFECT (reusable) =============== */
     .countdown {
       display: none; place-items: center; height: 140px; border-radius: 14px; border: 1px dashed var(--border);
       background: radial-gradient(600px 220px at 50% -20%, rgba(124,58,237,.18), transparent 60%);
@@ -315,15 +286,6 @@
       20% { opacity: 1; transform: translateY(0) scale(1.02); }
       100% { opacity: 0; transform: translateY(40px) scale(0.92); }
     }
-
-    .chart-wrap { height: 280px; border-radius: 14px; border: 1px solid var(--border); background: var(--bg-elev); padding: 10px; }
-
-    /* =============== DEVICE INFO TABLE =============== */
-    .kv {
-      display: grid; grid-template-columns: 140px 1fr; gap: 8px 14px; font-family: var(--mono); font-size: 13px;
-    }
-    .kv__k { color: var(--muted); }
-    .kv__v { color: var(--text); overflow-wrap: anywhere; }
 
     /* =============== FOOTER =============== */
     .footer {
@@ -383,8 +345,8 @@
       <div class="brand">
         <div class="brand__logo" aria-hidden="true"></div>
         <div>
-          <div class="brand__title">WebSocket Client App</div>
-          <div class="hint">Connect, control & observe devices via WebSocket</div>
+          <div class="brand__title">WebSocket Client</div>
+          <div class="hint">Connect & control via WebSocket</div>
         </div>
       </div>
 
@@ -457,13 +419,6 @@
 
         <div class="grid-2">
           <div class="field">
-            <label class="label" for="deviceList">Devices</label>
-            <select id="deviceList" class="select" aria-describedby="deviceListHint" oninput="AppUI.validateInput(event)">
-              <!-- Populated from storage and /info names -->
-            </select>
-            <div class="hint" id="deviceListHint">Device names come from /info. Errors are indicated inline.</div>
-          </div>
-          <div class="field">
             <label class="label" for="reconnectDelay">Reconnect Delay (ms)</label>
             <input
               id="reconnectDelay"
@@ -480,32 +435,11 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card__head">
-            <div class="card__title">Connected Device</div>
-            <div class="chip">
-              <svg class="icon"><use href="#i-check"></use></svg>
-              <span id="deviceStateChip">No device</span>
-            </div>
-          </div>
-          <div class="card__body">
-            <div class="kv" id="deviceInfo">
-              <div class="kv__k">Host</div><div class="kv__v" data-k="host">—</div>
-              <div class="kv__k">Name</div><div class="kv__v" data-k="name">—</div>
-              <div class="kv__k">Firmware</div><div class="kv__v" data-k="firmware">—</div>
-              <div class="kv__k">Uptime</div><div class="kv__v" data-k="uptime">—</div>
-            </div>
-          </div>
-        </div>
-
         <div class="actions">
           <div class="label">Actions</div>
           <div class="action-grid" id="actionsGrid">
             <button class="action" data-action="ws:send" data-message="ping:1">
               <svg class="icon"><use href="#i-send"></use></svg> <span>Ping</span>
-            </button>
-            <button class="action" data-action="http:get" data-path="/info">
-              <svg class="icon"><use href="#i-refresh"></use></svg> <span>Fetch /info</span>
             </button>
             <button class="action" data-action="app:clear-logs">
               <svg class="icon"><use href="#i-trash"></use></svg> <span>Clear Logs</span>
@@ -517,9 +451,20 @@
               <svg class="icon"><use href="#i-auto"></use></svg> <span>Toggle Auto</span>
             </button>
             <button class="action" data-action="ws:send" data-message="status:1">
-              <svg class="icon"><use href="#i-type"></use></svg> <span>Get Status</span>
+              <svg class="icon"><use href="#i-check"></use></svg> <span>Get Status</span>
+            </button>
+            <button class="action" data-action="ws:send" data-message="info:1">
+              <svg class="icon"><use href="#i-type"></use></svg> <span>Get Info</span>
             </button>
           </div>
+        </div>
+
+        <!-- Reusable countdown effect for custom actions -->
+        <div class="countdown" id="countdown" style="display: none;">
+          <div class="countdown__num" style="--delay:0s">3</div>
+          <div class="countdown__num" style="--delay:1s">2</div>
+          <div class="countdown__num" style="--delay:2s">1</div>
+          <div class="countdown__num" style="--delay:3s">Go!</div>
         </div>
       </div>
     </section>
@@ -560,85 +505,6 @@
           <div class="logline__tag">info</div>
         </div>
         -->
-      </div>
-    </section>
-
-    <!-- FULL-WIDTH TOOLS -->
-    <section class="card" style="grid-column: 1 / -1;">
-      <div class="card__head">
-        <div class="card__title">Tools & Telemetry</div>
-        <div class="flex center gap-10">
-          <span class="chip"><svg class="icon"><use href="#i-clock"></use></svg>Live WPM</span>
-          <span class="chip"><svg class="icon"><use href="#i-chart"></use></svg>History Chart</span>
-        </div>
-      </div>
-      <div class="card__body tools">
-        <!-- Typing / Paragraph -->
-        <div class="typing">
-          <div class="grid-2">
-            <div class="field">
-              <label class="label" for="paraLength">Random Paragraph Length (words)</label>
-              <input id="paraLength" class="input" type="number" min="10" max="200" step="5" value="60" required oninput="AppUI.validateInput(event)" />
-              <div class="error" id="paraLengthErr">Choose 10–200 words.</div>
-            </div>
-            <div class="row">
-              <button class="btn" id="genParagraphBtn">
-                <svg class="icon"><use href="#i-refresh"></use></svg> Generate
-              </button>
-              <button class="btn btn--primary" id="startTypingBtn">
-                <svg class="icon"><use href="#i-type"></use></svg> Start Test
-              </button>
-            </div>
-          </div>
-
-          <div class="paragraph" id="paragraphText" aria-live="polite">
-            Click <b>Generate</b> to create randomized text for typing.
-          </div>
-
-          <div class="countdown" id="countdown">
-            <div class="countdown__num" style="--delay:0s">3</div>
-            <div class="countdown__num" style="--delay:1s">2</div>
-            <div class="countdown__num" style="--delay:2s">1</div>
-            <div class="countdown__num" style="--delay:3s">Go!</div>
-          </div>
-
-          <div class="typefield" id="typingArea" contenteditable="true" spellcheck="false" aria-multiline="true" aria-label="Type here to measure WPM"></div>
-
-          <div class="stats">
-            <div class="stat">
-              <div class="stat__label">WPM</div>
-              <div class="stat__value" id="statWPM">0</div>
-            </div>
-            <div class="stat">
-              <div class="stat__label">Accuracy</div>
-              <div class="stat__value" id="statAcc">100%</div>
-            </div>
-            <div class="stat">
-              <div class="stat__label">Errors</div>
-              <div class="stat__value" id="statErr">0</div>
-            </div>
-            <div class="stat">
-              <div class="stat__label">Elapsed</div>
-              <div class="stat__value" id="statTime">0.0s</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Chart -->
-        <div>
-          <div class="field">
-            <label class="label" for="chartRange">History Range</label>
-            <select id="chartRange" class="select" oninput="AppUI.validateInput(event)">
-              <option value="10">Last 10</option>
-              <option value="30" selected>Last 30</option>
-              <option value="60">Last 60</option>
-              <option value="120">Last 120</option>
-            </select>
-          </div>
-          <div class="chart-wrap">
-            <canvas id="historyChart" width="800" height="260" aria-label="History chart" role="img"></canvas>
-          </div>
-        </div>
       </div>
     </section>
   </main>
