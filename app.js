@@ -65,6 +65,7 @@
 
     let filter = "all"; // all | ok | warn | err | rx | tx
     let counters = { rx: 0, tx: 0, err: 0 };
+    
     /** Public API */
     const api = {
       info(msg) {
@@ -87,6 +88,23 @@
         counters.tx++;
         updateCounters();
         append("tx", msg);
+      },
+      // New category-specific methods with badges
+      http(msg, status) {
+        const badge = status ? `HTTP ${status}` : 'HTTP';
+        appendWithBadge("ok", badge, msg, "http");
+      },
+      ws(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "WS", msg, "ws");
+      },
+      instance(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "INST", msg, "instance");
+      },
+      action(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "ACT", msg, "action");
       },
       raw(line, level = "ok") {
         append(level, line);
@@ -127,6 +145,30 @@
       } else if (level === "tx") {
         badge = '<span class="log-badge log-badge--tx">TX</span>';
       }
+      
+      line.innerHTML = `
+        <div class="logline__ts">${fmtTime()}</div>
+        <div class="logline__msg">${badge}${escapeHTML(String(msg))}</div>
+        <div class="logline__tag">${tagName(level)}</div>
+      `;
+      el.body.appendChild(line);
+      if (el.body.childElementCount > 2000) {
+        el.body.removeChild(el.body.firstElementChild);
+      }
+      if (shouldShow(level)) {
+        line.style.display = "";
+      } else {
+        line.style.display = "none";
+      }
+      el.body.scrollTop = el.body.scrollHeight + 1000;
+    }
+
+    function appendWithBadge(level, badgeText, msg, badgeType = "info") {
+      const line = document.createElement("div");
+      line.className = `logline log--${level}`;
+      
+      // Create colored badge based on type
+      const badge = `<span class="log-badge log-badge--${badgeType}">${escapeHTML(badgeText)}</span>`;
       
       line.innerHTML = `
         <div class="logline__ts">${fmtTime()}</div>
@@ -232,10 +274,10 @@
   const HTTPClient = {
     async get(url, path = "/") {
       const httpUrl = toHttpBase(url) + path;
-      Log.info(`http:get:${httpUrl}`);
+      Log.http(`GET ${httpUrl}`);
       const r = await fetch(httpUrl, { cache: "no-store" });
       const txt = await r.text();
-      Log.info(`http:status:${r.status}`);
+      Log.http(`Response from ${path}`, r.status);
       return { status: r.status, text: txt };
     },
     parseInfo(text) {
@@ -283,16 +325,16 @@
     }
     connect() {
       const url = this.getUrl();
-      if (!url) return Log.warn("ws:no-url");
+      if (!url) return Log.ws("No URL configured", "warn");
       this._manualClose = false;
       try {
-        Log.info(`connecting:${url}`);
+        Log.ws(`Connecting to ${url}`);
         const ws = new WebSocket(url);
         this.ws = ws;
 
         ws.addEventListener("open", () => {
           this._attempt = 0;
-          Log.info(`connected:${url}`);
+          Log.ws(`Connected to ${url}`);
           this.onOpen?.();
         });
 
@@ -303,19 +345,19 @@
         });
 
         ws.addEventListener("error", (ev) => {
-          Log.error(`ws:error:${ev.message || "unknown"}`);
+          Log.ws(`Error: ${ev.message || "unknown"}`, "error");
           this.onError?.(ev);
         });
 
         ws.addEventListener("close", (ev) => {
-          Log.warn(`closed:code=${ev.code} reason=${ev.reason || "none"}`);
+          Log.ws(`Closed (code=${ev.code}, reason=${ev.reason || "none"})`, "warn");
           this.onClose?.(ev);
           if (!this._manualClose && App.state.autoReconnect) {
             this.scheduleReconnect();
           }
         });
       } catch (e) {
-        Log.error(`ws:connect-throw:${e.message}`);
+        Log.ws(`Connection failed: ${e.message}`, "error");
         this.scheduleReconnect();
       }
     }
@@ -326,7 +368,7 @@
       const backoff = Math.min(8000, this._attempt * 300);
       const delay = base + jitter + backoff;
       this._attempt++;
-      Log.warn(`reconnect-in:${Math.round(delay)}ms`);
+      Log.ws(`Reconnecting in ${Math.round(delay)}ms`, "warn");
       this._reconnectTimer = setTimeout(() => this.connect(), delay);
     }
     disconnect() {
@@ -343,7 +385,7 @@
         Log.tx(text);
         return true;
       } else {
-        Log.warn("ws:send-failed:not-open");
+        Log.ws("Send failed: connection not open", "warn");
         return false;
       }
     }
@@ -364,11 +406,11 @@
 
     async function run(name, ctx, el) {
       const fn = registry.get(name);
-      if (!fn) return Log.warn(`action:unknown:${name}`);
+      if (!fn) return Log.action(`Unknown action: ${name}`, "warn");
       try {
         await fn(ctx, el);
       } catch (e) {
-        Log.error(`action:error:${name}:${e.message}`);
+        Log.action(`Error in ${name}: ${e.message}`, "error");
       }
     }
 
@@ -381,7 +423,11 @@
     define("http:get", async (ctx, el) => {
       const path = el?.getAttribute("data-path") || "/";
       const { status, text } = await HTTPClient.get(ctx.url(), path);
-      Log.info(`http:body:${text.slice(0, 500)}${text.length > 500 ? "…" : ""}`);
+      if (text.length <= 500) {
+        Log.http(`Response body: ${text}`);
+      } else {
+        Log.http(`Response body: ${text.slice(0, 500)}... (${text.length} chars)`);
+      }
       if (path === "/info") {
         const info = HTTPClient.parseInfo(text);
         UI.setInstanceInfo(ctx.url(), info);
@@ -399,7 +445,7 @@
       App.state.autoReconnect = !App.state.autoReconnect;
       UI.updateAutoToggle();
       App.persist();
-      Log.info(`autoReconnect:${App.state.autoReconnect}`);
+      Log.action(`Auto-reconnect ${App.state.autoReconnect ? 'enabled' : 'disabled'}`);
     });
 
     // Example of an easy custom action you can add later:
@@ -703,13 +749,13 @@
         if (String(res.status).startsWith("2")) {
           const info = HTTPClient.parseInfo(res.text);
           UI.setInstanceInfo(url, info);
-          Log.info("instance:available");
+          Log.instance("Instance available and responding");
         } else {
           UI.setInstanceError(url, `http:${res.status}`);
-          Log.warn(`instance:info-status:${res.status}`);
+          Log.instance(`Instance returned status ${res.status}`, "warn");
         }
       } catch (e) {
-        Log.warn(`instance:info-failed:${e.message}`);
+        Log.instance(`Failed to fetch instance info: ${e.message}`, "warn");
         UI.setInstanceError(url, e.message);
       }
 
