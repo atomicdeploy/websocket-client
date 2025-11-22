@@ -135,9 +135,6 @@
     };
 
     function append(level, msg) {
-      const line = document.createElement("div");
-      line.className = `logline log--${level}`;
-      
       // Create badge for rx/tx, regular tag for others
       let badge = "";
       if (level === "rx") {
@@ -146,29 +143,18 @@
         badge = '<span class="log-badge log-badge--tx">TX</span>';
       }
       
-      line.innerHTML = `
-        <div class="logline__ts">${fmtTime()}</div>
-        <div class="logline__msg">${badge}${escapeHTML(String(msg))}</div>
-        <div class="logline__tag">${tagName(level)}</div>
-      `;
-      el.body.appendChild(line);
-      if (el.body.childElementCount > 2000) {
-        el.body.removeChild(el.body.firstElementChild);
-      }
-      if (shouldShow(level)) {
-        line.style.display = "";
-      } else {
-        line.style.display = "none";
-      }
-      el.body.scrollTop = el.body.scrollHeight + 1000;
+      addLogLine(level, badge, msg);
     }
 
     function appendWithBadge(level, badgeText, msg, badgeType = "info") {
-      const line = document.createElement("div");
-      line.className = `logline log--${level}`;
-      
       // Create colored badge based on type
       const badge = `<span class="log-badge log-badge--${badgeType}">${escapeHTML(badgeText)}</span>`;
+      addLogLine(level, badge, msg);
+    }
+
+    function addLogLine(level, badge, msg) {
+      const line = document.createElement("div");
+      line.className = `logline log--${level}`;
       
       line.innerHTML = `
         <div class="logline__ts">${fmtTime()}</div>
