@@ -63,8 +63,9 @@
       downloadBtn: qs("#downloadLogsBtn"),
     };
 
-    let filter = "all"; // all | ok | warn | err
+    let filter = "all"; // all | ok | warn | err | rx | tx
     let counters = { rx: 0, tx: 0, err: 0 };
+    
     /** Public API */
     const api = {
       info(msg) {
@@ -81,12 +82,29 @@
       rx(msg) {
         counters.rx++;
         updateCounters();
-        append("ok", `rx:${msg}`);
+        append("rx", msg);
       },
       tx(msg) {
         counters.tx++;
         updateCounters();
-        append("ok", `tx:${msg}`);
+        append("tx", msg);
+      },
+      // New category-specific methods with badges
+      http(msg, status) {
+        const badge = status ? `HTTP ${status}` : 'HTTP';
+        appendWithBadge("ok", badge, msg, "http");
+      },
+      ws(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "WS", msg, "ws");
+      },
+      instance(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "INST", msg, "instance");
+      },
+      action(msg, status = "info") {
+        const levelMap = { info: "ok", warn: "warn", error: "err" };
+        appendWithBadge(levelMap[status] || "ok", "ACT", msg, "action");
       },
       raw(line, level = "ok") {
         append(level, line);
@@ -117,11 +135,30 @@
     };
 
     function append(level, msg) {
+      // Create badge for rx/tx, regular tag for others
+      let badge = "";
+      if (level === "rx") {
+        badge = '<span class="log-badge log-badge--rx">RX</span>';
+      } else if (level === "tx") {
+        badge = '<span class="log-badge log-badge--tx">TX</span>';
+      }
+      
+      addLogLine(level, badge, msg);
+    }
+
+    function appendWithBadge(level, badgeText, msg, badgeType = "info") {
+      // Create colored badge based on type
+      const badge = `<span class="log-badge log-badge--${badgeType}">${escapeHTML(badgeText)}</span>`;
+      addLogLine(level, badge, msg);
+    }
+
+    function addLogLine(level, badge, msg) {
       const line = document.createElement("div");
       line.className = `logline log--${level}`;
+      
       line.innerHTML = `
         <div class="logline__ts">${fmtTime()}</div>
-        <div class="logline__msg">${escapeHTML(String(msg))}</div>
+        <div class="logline__msg">${badge}${escapeHTML(String(msg))}</div>
         <div class="logline__tag">${tagName(level)}</div>
       `;
       el.body.appendChild(line);
@@ -146,6 +183,8 @@
       if (level === "ok") return "info";
       if (level === "warn") return "warn";
       if (level === "err") return "error";
+      if (level === "rx") return "recv";
+      if (level === "tx") return "sent";
       return level;
     }
 
@@ -216,15 +255,15 @@
   })();
 
   /*****************************
-   * HTTP Client (/info parser)
+   * HTTP Client (reusable for fetching instance info)
    *****************************/
   const HTTPClient = {
     async get(url, path = "/") {
       const httpUrl = toHttpBase(url) + path;
-      Log.info(`http:get:${httpUrl}`);
+      Log.http(`GET ${httpUrl}`);
       const r = await fetch(httpUrl, { cache: "no-store" });
       const txt = await r.text();
-      Log.info(`http:status:${r.status}`);
+      Log.http(`Response from ${path}`, r.status);
       return { status: r.status, text: txt };
     },
     parseInfo(text) {
@@ -255,9 +294,9 @@
   }
 
   /*****************************
-   * WS Client (auto reconnect)
+   * Unified Connection Client (WebSocket + Socket.IO)
    *****************************/
-  class WSClient {
+  class ConnectionClient {
     constructor({ onOpen, onClose, onMessage, onError, getUrl, getDelay }) {
       this.onOpen = onOpen;
       this.onClose = onClose;
@@ -265,23 +304,60 @@
       this.onError = onError;
       this.getUrl = getUrl;
       this.getDelay = getDelay;
-      this.ws = null;
+      this.connection = null;
+      this.connectionType = null; // 'websocket' or 'socketio'
       this._reconnectTimer = null;
       this._manualClose = false;
       this._attempt = 0;
     }
+
+    _detectConnectionType(url) {
+      // Auto-detect: if URL uses HTTP/HTTPS, use Socket.IO
+      // Otherwise use native WebSocket for ws:// and wss://
+      try {
+        const urlObj = new URL(url);
+        const protocol = urlObj.protocol;
+        
+        // Check protocol: http/https → Socket.IO, ws/wss → WebSocket
+        if (protocol === 'http:' || protocol === 'https:') {
+          return 'socketio';
+        } else if (protocol === 'ws:' || protocol === 'wss:') {
+          return 'websocket';
+        }
+        
+        // Default to websocket for unknown protocols
+        return 'websocket';
+      } catch (e) {
+        // If URL parsing fails, default to websocket
+        Log.ws(`Failed to parse URL, defaulting to WebSocket: ${e.message}`, "warn");
+        return 'websocket';
+      }
+    }
+
     connect() {
       const url = this.getUrl();
-      if (!url) return Log.warn("ws:no-url");
+      if (!url) return Log.ws("No URL configured", "warn");
       this._manualClose = false;
+      
+      // Detect connection type
+      this.connectionType = this._detectConnectionType(url);
+      
+      if (this.connectionType === 'socketio') {
+        this._connectSocketIO(url);
+      } else {
+        this._connectWebSocket(url);
+      }
+    }
+
+    _connectWebSocket(url) {
       try {
-        Log.info(`connecting:${url}`);
+        Log.ws(`Connecting via WebSocket to ${url}`);
         const ws = new WebSocket(url);
-        this.ws = ws;
+        this.connection = ws;
 
         ws.addEventListener("open", () => {
           this._attempt = 0;
-          Log.info(`connected:${url}`);
+          Log.ws(`Connected via WebSocket to ${url}`);
           this.onOpen?.();
         });
 
@@ -292,22 +368,105 @@
         });
 
         ws.addEventListener("error", (ev) => {
-          Log.error(`ws:error:${ev.message || "unknown"}`);
+          Log.ws(`Error: ${ev.message || "unknown"}`, "error");
           this.onError?.(ev);
         });
 
         ws.addEventListener("close", (ev) => {
-          Log.warn(`closed:code=${ev.code} reason=${ev.reason || "none"}`);
+          Log.ws(`Closed (code=${ev.code}, reason=${ev.reason || "none"})`, "warn");
           this.onClose?.(ev);
           if (!this._manualClose && App.state.autoReconnect) {
             this.scheduleReconnect();
           }
         });
       } catch (e) {
-        Log.error(`ws:connect-throw:${e.message}`);
+        Log.ws(`Connection failed: ${e.message}`, "error");
         this.scheduleReconnect();
       }
     }
+
+    _connectSocketIO(url) {
+      try {
+        // Convert ws:// or wss:// URLs to http:// or https://
+        let ioUrl = url;
+        if (url.startsWith('ws://')) {
+          ioUrl = url.replace('ws://', 'http://');
+        } else if (url.startsWith('wss://')) {
+          ioUrl = url.replace('wss://', 'https://');
+        }
+        
+        // Remove any path like /ws from the URL for Socket.IO
+        const urlObj = new URL(ioUrl);
+        const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
+        
+        Log.ws(`Connecting via Socket.IO to ${baseUrl}`);
+        
+        // Check if Socket.IO is loaded
+        if (typeof io === 'undefined') {
+          Log.ws("Socket.IO library not loaded", "error");
+          return;
+        }
+        
+        const socket = io(baseUrl, {
+          reconnection: false, // We handle reconnection manually
+          transports: ['websocket', 'polling'] // Try websocket first, fallback to polling
+        });
+        this.connection = socket;
+
+        socket.on("connect", () => {
+          this._attempt = 0;
+          Log.ws(`Connected via Socket.IO to ${baseUrl}`);
+          this.onOpen?.();
+        });
+
+        socket.on("message", (data) => {
+          // Standard message event - keep original format
+          const text = typeof data === 'string' ? data : JSON.stringify(data);
+          Log.rx(text);
+          this.onMessage?.(text);
+        });
+
+        // Listen for any custom events as well
+        socket.onAny((eventName, ...args) => {
+          if (eventName !== 'connect' && eventName !== 'disconnect' && eventName !== 'message' && eventName !== 'error' && eventName !== 'connect_error') {
+            // For custom events, we need to indicate the event name somehow
+            // Send as-is if single string argument, otherwise wrap with event info
+            if (args.length === 1 && typeof args[0] === 'string') {
+              Log.rx(args[0]);
+              this.onMessage?.(args[0]);
+            } else {
+              const text = JSON.stringify({ event: eventName, data: args });
+              Log.rx(text);
+              this.onMessage?.(text);
+            }
+          }
+        });
+
+        socket.on("error", (err) => {
+          Log.ws(`Error: ${err.message || "unknown"}`, "error");
+          this.onError?.(err);
+        });
+
+        socket.on("disconnect", (reason) => {
+          Log.ws(`Disconnected (reason: ${reason})`, "warn");
+          this.onClose?.({ reason });
+          if (!this._manualClose && App.state.autoReconnect) {
+            this.scheduleReconnect();
+          }
+        });
+
+        socket.on("connect_error", (err) => {
+          Log.ws(`Connection error: ${err.message}`, "error");
+          if (!this._manualClose && App.state.autoReconnect) {
+            this.scheduleReconnect();
+          }
+        });
+      } catch (e) {
+        Log.ws(`Connection failed: ${e.message}`, "error");
+        this.scheduleReconnect();
+      }
+    }
+
     scheduleReconnect() {
       clearTimeout(this._reconnectTimer);
       const base = Number(App.state.reconnectDelay) || 1500;
@@ -315,29 +474,73 @@
       const backoff = Math.min(8000, this._attempt * 300);
       const delay = base + jitter + backoff;
       this._attempt++;
-      Log.warn(`reconnect-in:${Math.round(delay)}ms`);
+      Log.ws(`Reconnecting in ${Math.round(delay)}ms`, "warn");
       this._reconnectTimer = setTimeout(() => this.connect(), delay);
     }
+
     disconnect() {
       this._manualClose = true;
       clearTimeout(this._reconnectTimer);
-      if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-        this.ws.close(1000, "client-close");
+      
+      if (this.connection) {
+        if (this.connectionType === 'socketio') {
+          this.connection.disconnect();
+        } else if (this.connectionType === 'websocket') {
+          if (this.connection.readyState === WebSocket.OPEN || this.connection.readyState === WebSocket.CONNECTING) {
+            this.connection.close(1000, "client-close");
+          }
+        }
       }
-      this.ws = null;
+      this.connection = null;
     }
+
     send(text) {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(text);
-        Log.tx(text);
-        return true;
-      } else {
-        Log.warn("ws:send-failed:not-open");
+      if (!this.connection) {
+        Log.ws("Send failed: not connected", "warn");
         return false;
       }
+
+      if (this.connectionType === 'socketio') {
+        if (this.connection.connected) {
+          // Try to parse as JSON to send as object, otherwise send as message event
+          try {
+            const data = JSON.parse(text);
+            if (data.event) {
+              // If message has event field, emit that event
+              this.connection.emit(data.event, data.data || data);
+            } else {
+              this.connection.emit('message', text);
+            }
+          } catch {
+            this.connection.emit('message', text);
+          }
+          Log.tx(text);
+          return true;
+        } else {
+          Log.ws("Send failed: Socket.IO not connected", "warn");
+          return false;
+        }
+      } else if (this.connectionType === 'websocket') {
+        if (this.connection.readyState === WebSocket.OPEN) {
+          this.connection.send(text);
+          Log.tx(text);
+          return true;
+        } else {
+          Log.ws("Send failed: connection not open", "warn");
+          return false;
+        }
+      }
+      return false;
     }
+
     isOpen() {
-      return this.ws?.readyState === WebSocket.OPEN;
+      if (!this.connection) return false;
+      if (this.connectionType === 'socketio') {
+        return this.connection.connected;
+      } else if (this.connectionType === 'websocket') {
+        return this.connection.readyState === WebSocket.OPEN;
+      }
+      return false;
     }
   }
 
@@ -353,11 +556,11 @@
 
     async function run(name, ctx, el) {
       const fn = registry.get(name);
-      if (!fn) return Log.warn(`action:unknown:${name}`);
+      if (!fn) return Log.action(`Unknown action: ${name}`, "warn");
       try {
         await fn(ctx, el);
       } catch (e) {
-        Log.error(`action:error:${name}:${e.message}`);
+        Log.action(`Error in ${name}: ${e.message}`, "error");
       }
     }
 
@@ -370,10 +573,14 @@
     define("http:get", async (ctx, el) => {
       const path = el?.getAttribute("data-path") || "/";
       const { status, text } = await HTTPClient.get(ctx.url(), path);
-      Log.info(`http:body:${text.slice(0, 500)}${text.length > 500 ? "…" : ""}`);
+      if (text.length <= 500) {
+        Log.http(`Response body: ${text}`);
+      } else {
+        Log.http(`Response body: ${text.slice(0, 500)}... (${text.length} chars)`);
+      }
       if (path === "/info") {
         const info = HTTPClient.parseInfo(text);
-        UI.setDeviceInfo(ctx.url(), info);
+        UI.setInstanceInfo(ctx.url(), info);
       }
     });
 
@@ -388,7 +595,7 @@
       App.state.autoReconnect = !App.state.autoReconnect;
       UI.updateAutoToggle();
       App.persist();
-      Log.info(`autoReconnect:${App.state.autoReconnect}`);
+      Log.action(`Auto-reconnect ${App.state.autoReconnect ? 'enabled' : 'disabled'}`);
     });
 
     // Example of an easy custom action you can add later:
@@ -410,25 +617,14 @@
       serverUrl: qs("#serverUrl"),
       saveServerBtn: qs("#saveServerBtn"),
       recentServers: qs("#recentServers"),
-      deviceList: qs("#deviceList"),
+      instanceList: qs("#instanceList"),
       autoConnect: qs("#autoConnect"),
       autoReconnect: qs("#autoReconnect"),
       reconnectDelay: qs("#reconnectDelay"),
-      deviceInfo: qs("#deviceInfo"),
-      deviceStateChip: qs("#deviceStateChip"),
+      instanceInfo: qs("#instanceInfo"),
+      instanceStateChip: qs("#instanceStateChip"),
       actionsGrid: qs("#actionsGrid"),
-      chartRange: qs("#chartRange"),
-      // Tools
-      paraLength: qs("#paraLength"),
-      genParagraphBtn: qs("#genParagraphBtn"),
-      startTypingBtn: qs("#startTypingBtn"),
-      paragraphText: qs("#paragraphText"),
       countdown: qs("#countdown"),
-      typingArea: qs("#typingArea"),
-      statWPM: qs("#statWPM"),
-      statAcc: qs("#statAcc"),
-      statErr: qs("#statErr"),
-      statTime: qs("#statTime"),
     };
 
     function init() {
@@ -462,9 +658,9 @@
         App.persist();
       });
 
-      // Devices dropdown
-      el.deviceList.addEventListener("input", () => {
-        const url = el.deviceList.value;
+      // Instance dropdown
+      el.instanceList.addEventListener("input", () => {
+        const url = el.instanceList.value;
         if (url) {
           el.serverUrl.value = url;
           App.state.serverUrl = url;
@@ -480,22 +676,10 @@
         Actions.run(name, App.ctx(), btn);
       });
 
-      // Chart range
-      el.chartRange.addEventListener("input", () => {
-        Chart.draw();
-        Storage.set("chartRange", el.chartRange.value);
-      });
-
-      // Tools
-      el.genParagraphBtn.addEventListener("click", TypingTest.generateParagraph);
-      el.startTypingBtn.addEventListener("click", TypingTest.startCountdown);
-      el.typingArea.addEventListener("input", TypingTest.onType);
-      el.typingArea.addEventListener("keydown", TypingTest.onKey);
-
       // Live validation hooks are provided by AppUI.validateInput
       populateFromState();
       populateHistory();
-      populateDevices();
+      populateInstances();
 
       // Auto-connect if requested
       if (App.state.autoConnect && App.state.serverUrl) {
@@ -509,7 +693,6 @@
       el.autoConnect.checked = !!s.autoConnect;
       el.autoReconnect.checked = s.autoReconnect !== false;
       el.reconnectDelay.value = s.reconnectDelay ?? 1500;
-      el.chartRange.value = Storage.get("chartRange", "30");
     }
 
     function populateHistory() {
@@ -517,15 +700,15 @@
       el.recentServers.innerHTML = recent.map((u) => `<option value="${escapeHTML(u)}">`).join("");
     }
 
-    function populateDevices() {
-      const devices = Storage.get("devices", []); // [{url,name,lastError}]
-      el.deviceList.innerHTML = "";
-      devices.forEach((d) => {
+    function populateInstances() {
+      const instances = Storage.get("instances", []); // [{url,name,lastError}]
+      el.instanceList.innerHTML = "";
+      instances.forEach((d) => {
         const o = document.createElement("option");
         o.value = d.url;
         o.textContent = d.name ? `${d.name} — ${d.url}` : d.url;
         if (d.lastError) o.textContent += ` (err)`;
-        el.deviceList.appendChild(o);
+        el.instanceList.appendChild(o);
       });
     }
 
@@ -557,35 +740,35 @@
         Storage.set("recentServers", recent);
         populateHistory();
       }
-      addOrUpdateDevice(url, { name: "", lastError: "" });
-      populateDevices();
+      addOrUpdateInstance(url, { name: "", lastError: "" });
+      populateInstances();
       Toast.ok("Saved to history");
     }
 
-    function addOrUpdateDevice(url, { name, lastError }) {
-      const devices = Storage.get("devices", []);
-      const i = devices.findIndex((d) => d.url === url);
-      if (i === -1) devices.push({ url, name: name || "", lastError: lastError || "" });
+    function addOrUpdateInstance(url, { name, lastError }) {
+      const instances = Storage.get("instances", []);
+      const i = instances.findIndex((d) => d.url === url);
+      if (i === -1) instances.push({ url, name: name || "", lastError: lastError || "" });
       else {
-        if (name !== undefined) devices[i].name = name;
-        if (lastError !== undefined) devices[i].lastError = lastError;
+        if (name !== undefined) instances[i].name = name;
+        if (lastError !== undefined) instances[i].lastError = lastError;
       }
-      Storage.set("devices", devices);
+      Storage.set("instances", instances);
     }
 
-    function setDeviceInfo(url, info) {
-      qs('[data-k="host"]', el.deviceInfo).textContent = new URL(url).host;
-      qs('[data-k="name"]', el.deviceInfo).textContent = info.name || "—";
-      qs('[data-k="firmware"]', el.deviceInfo).textContent = info.firmware || "—";
-      qs('[data-k="uptime"]', el.deviceInfo).textContent = info.uptime || "—";
-      el.deviceStateChip.textContent = info.name ? `${info.name}` : "Device";
-      addOrUpdateDevice(url, { name: info.name || "", lastError: "" });
-      populateDevices();
+    function setInstanceInfo(url, info) {
+      qs('[data-k="host"]', el.instanceInfo).textContent = new URL(url).host;
+      qs('[data-k="name"]', el.instanceInfo).textContent = info.name || "—";
+      qs('[data-k="firmware"]', el.instanceInfo).textContent = info.firmware || "—";
+      qs('[data-k="uptime"]', el.instanceInfo).textContent = info.uptime || "—";
+      el.instanceStateChip.textContent = info.name ? `${info.name}` : "Instance";
+      addOrUpdateInstance(url, { name: info.name || "", lastError: "" });
+      populateInstances();
     }
 
-    function setDeviceError(url, errText) {
-      addOrUpdateDevice(url, { lastError: errText || "error" });
-      populateDevices();
+    function setInstanceError(url, errText) {
+      addOrUpdateInstance(url, { lastError: errText || "error" });
+      populateInstances();
     }
 
     function updateButtons(connected) {
@@ -597,13 +780,9 @@
       el.autoReconnect.checked = !!App.state.autoReconnect;
     }
 
-    function clearDeviceInfo() {
-      qsa(".kv__v", el.deviceInfo).forEach((n) => (n.textContent = "—"));
-      el.deviceStateChip.textContent = "No device";
-    }
-
-    function setTypingError(on) {
-      el.typingArea.classList.toggle("error", !!on);
+    function clearInstanceInfo() {
+      qsa(".kv__v", el.instanceInfo).forEach((n) => (n.textContent = "—"));
+      el.instanceStateChip.textContent = "No instance";
     }
 
     return {
@@ -611,9 +790,9 @@
       setStatus,
       updateButtons,
       updateAutoToggle,
-      setDeviceInfo,
-      setDeviceError,
-      clearDeviceInfo,
+      setInstanceInfo,
+      setInstanceError,
+      clearInstanceInfo,
       elements: el,
     };
   })();
@@ -623,7 +802,7 @@
    *****************************/
   const Validators = {
     url(v) {
-      return /^wss?:\/\/([^\s:\/]+)(:\d+)?(\/[^\s]*)?$/.test(v);
+      return /^(wss?|https?):\/\/([^\s:\/]+)(:\d+)?(\/[^\s]*)?$/.test(v);
     },
     numberIn(v, min, max) {
       const n = Number(v);
@@ -642,9 +821,6 @@
       } else if (t.id === "reconnectDelay") {
         const ok = Validators.numberIn(t.value, 250, 60000);
         AppUI.markInvalid(t, "reconnectDelayErr", !ok);
-      } else if (t.id === "paraLength") {
-        const ok = Validators.numberIn(t.value, 10, 200);
-        AppUI.markInvalid(t, "paraLengthErr", !ok);
       } else {
         // generic check for required fields
         AppUI.markInvalid(t, "", !t.checkValidity());
@@ -661,241 +837,25 @@
   };
 
   /*****************************
-   * Typing Test (paragraph, WPM, errors, countdown)
+   * Countdown Effect (reusable)
    *****************************/
-  const TypingTest = (() => {
-    const el = UI.elements;
-    const WORDS =
-      "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu amber neon xenon argon helium lithium beryllium boron carbon nitrogen oxygen fluorine sodium magnesium silicon phosphorus sulfur chlorine potassium calcium titanium chromium manganese iron cobalt nickel copper zinc gallium germanium arsenic selenium bromine krypton rubidium strontium zirconium molybdenum silver tin antimony iodine xenial stellar quantum pixel vertex lambda omega sigma gamma beta atlas comet nebula vector matrix kernel socket thread buffer packet frame stream".split(
-        /\s+/
-      );
-    let target = "";
-    let startedAt = 0;
-    let lastStatsAt = 0;
-    let timer = null;
-    let errors = 0;
-
-    function generateParagraph() {
-      const n = clamp(Number(el.paraLength.value) || 60, 10, 200);
-      const parts = [];
-      for (let i = 0; i < n; i++) {
-        parts.push(WORDS[(Math.random() * WORDS.length) | 0]);
-      }
-      target = parts.join(" ");
-      el.paragraphText.textContent = target;
-      el.typingArea.textContent = "";
-      resetStats();
-      Log.info(`para:generated:${n}w`);
-    }
-
-    function startCountdown() {
-      if (!target) generateParagraph();
-      showCountdown();
-    }
-
-    async function showCountdown() {
-      const c = el.countdown;
-      c.classList.add("show");
+  const Countdown = (() => {
+    async function show(el, onComplete) {
+      if (!el) return;
+      el.classList.add("show");
       // retrigger CSS animations
-      c.querySelectorAll(".countdown__num").forEach((n) => {
+      el.querySelectorAll(".countdown__num").forEach((n) => {
         n.style.animation = "none";
         // eslint-disable-next-line no-unused-expressions
         n.offsetHeight; // reflow
         n.style.animation = "";
       });
       await sleep(4000);
-      c.classList.remove("show");
-      startTyping();
+      el.classList.remove("show");
+      if (onComplete) onComplete();
     }
 
-    function startTyping() {
-      el.typingArea.focus();
-      startedAt = performance.now();
-      lastStatsAt = startedAt;
-      errors = 0;
-      UI.setTypingError(false);
-      updateStats();
-    }
-
-    function onKey(e) {
-      // prevent multiline (Enter creates newline)
-      if (e.key === "Enter") {
-        e.preventDefault();
-        return false;
-      }
-      return true;
-    }
-
-    function onType() {
-      const current = el.typingArea.textContent;
-      // realtime error highlighting: mark red state if trailing char mismatches
-      const mismatch = firstMismatchIndex(current, target);
-      const hasError = mismatch !== -1;
-      UI.setTypingError(hasError);
-
-      if (hasError) errors++;
-      updateStats();
-
-      // test complete
-      if (current.length >= target.length) {
-        finish();
-      }
-    }
-
-    function firstMismatchIndex(a, b) {
-      const n = Math.min(a.length, b.length);
-      for (let i = 0; i < n; i++) {
-        if (a[i] !== b[i]) return i;
-      }
-      return a.length > b.length ? n : -1;
-    }
-
-    function updateStats() {
-      const nowT = performance.now();
-      const elapsedSec = (nowT - startedAt) / 1000;
-      const chars = el.typingArea.textContent.length;
-      const words = chars / 5;
-      const wpm = elapsedSec > 0 ? (words / elapsedSec) * 60 : 0;
-      const acc = target.length
-        ? Math.max(0, 100 - (errors / Math.max(chars, 1)) * 100)
-        : 100;
-
-      el.statWPM.textContent = Math.round(wpm);
-      el.statAcc.textContent = `${Math.round(acc)}%`;
-      el.statErr.textContent = errors;
-      el.statTime.textContent = `${(elapsedSec || 0).toFixed(1)}s`;
-
-      lastStatsAt = nowT;
-    }
-
-    function finish() {
-      updateStats();
-      const score = {
-        time: Date.now(),
-        wpm: Number(el.statWPM.textContent),
-        acc: Number(el.statAcc.textContent.replace("%", "")),
-        err: errors,
-      };
-      History.add(score);
-      Chart.draw();
-      Toast.ok(`Finished • WPM ${score.wpm} • Acc ${score.acc}%`);
-      Log.info(`typing:done:wpm=${score.wpm} acc=${score.acc} err=${score.err}`);
-    }
-
-    function resetStats() {
-      el.statWPM.textContent = "0";
-      el.statAcc.textContent = "100%";
-      el.statErr.textContent = "0";
-      el.statTime.textContent = "0.0s";
-      UI.setTypingError(false);
-    }
-
-    return { generateParagraph, startCountdown, onType, onKey };
-  })();
-
-  /*****************************
-   * History (scores) + Chart
-   *****************************/
-  const History = {
-    add(entry) {
-      const arr = Storage.get("history", []);
-      arr.push(entry);
-      if (arr.length > 500) arr.shift();
-      Storage.set("history", arr);
-    },
-    get(range = 30) {
-      const arr = Storage.get("history", []);
-      return arr.slice(-range);
-    },
-  };
-
-  const Chart = (() => {
-    const canvas = qs("#historyChart");
-    const ctx = canvas.getContext("2d");
-
-    function draw() {
-      const range = Number(qs("#chartRange").value || "30");
-      const data = History.get(range);
-      resizeForDPR();
-      clear();
-      axes();
-      if (data.length === 0) return;
-
-      const pad = 30;
-      const W = canvas.width;
-      const H = canvas.height;
-      const x0 = pad;
-      const y0 = H - pad;
-      const x1 = W - pad;
-      const y1 = pad;
-
-      const maxWPM = Math.max(60, Math.max(...data.map((d) => d.wpm)) + 10);
-      const maxErr = Math.max(5, Math.max(...data.map((d) => d.err)) + 1);
-
-      // line for WPM
-      ctx.beginPath();
-      data.forEach((d, i) => {
-        const x = lerp(x0, x1, i / Math.max(1, data.length - 1));
-        const y = map(d.wpm, 0, maxWPM, y0, y1);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      // bars for errors
-      const bw = Math.max(2, (x1 - x0) / Math.max(1, data.length * 2));
-      data.forEach((d, i) => {
-        const x = lerp(x0, x1, i / Math.max(1, data.length - 1));
-        const y = map(d.err, 0, maxErr, y0, y1);
-        ctx.fillRect(x - bw / 2, y, bw, y0 - y);
-      });
-
-      // labels
-      ctx.font = `${12 * devicePixelRatio}px ${getComputedStyle(document.body).fontFamily}`;
-      ctx.fillText("WPM", x1 - 40, y1 + 14);
-      ctx.fillText("Errors", x1 - 50, y1 + 30);
-    }
-
-    function resizeForDPR() {
-      const dpr = window.devicePixelRatio || 1;
-      const rect = canvas.getBoundingClientRect();
-      if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) {
-        canvas.width = rect.width * dpr;
-        canvas.height = rect.height * dpr;
-      }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.scale(1 / dpr, 1 / dpr);
-    }
-
-    function clear() {
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-    }
-
-    function axes() {
-      const W = canvas.width;
-      const H = canvas.height;
-      const pad = 30;
-      ctx.beginPath();
-      ctx.moveTo(pad, H - pad);
-      ctx.lineTo(W - pad, H - pad);
-      ctx.moveTo(pad, H - pad);
-      ctx.lineTo(pad, pad);
-      ctx.stroke();
-    }
-
-    function lerp(a, b, t) {
-      return a + (b - a) * t;
-    }
-    function map(v, a1, a2, b1, b2) {
-      const t = (v - a1) / (a2 - a1);
-      return b1 + (b2 - b1) * (1 - t);
-    }
-
-    window.addEventListener("resize", draw);
-    return { draw };
+    return { show };
   })();
 
   /*****************************
@@ -925,28 +885,31 @@
       const url = UI.elements.serverUrl.value.trim();
       if (!Validators.url(url)) {
         AppUI.markInvalid(UI.elements.serverUrl, "serverUrlErr", true);
-        return Toast.err("Enter a valid WebSocket URL.");
+        return Toast.err("Enter a valid URL (WebSocket or Socket.IO)");
       }
       App.state.serverUrl = url;
       App.persist();
       UI.updateButtons(true);
       UI.setStatus("warn", "Connecting…");
-      UI.clearDeviceInfo();
+      UI.clearInstanceInfo();
 
-      // Check availability via /info first
-      try {
-        const res = await HTTPClient.get(url, "/info");
-        if (String(res.status).startsWith("2")) {
-          const info = HTTPClient.parseInfo(res.text);
-          UI.setDeviceInfo(url, info);
-          Log.info("device:available");
-        } else {
-          UI.setDeviceError(url, `http:${res.status}`);
-          Log.warn(`device:info-status:${res.status}`);
+      // Check availability via /info only for WebSocket URLs
+      // Socket.IO servers may not have this endpoint
+      if (url.startsWith('ws://') || url.startsWith('wss://')) {
+        try {
+          const res = await HTTPClient.get(url, "/info");
+          if (String(res.status).startsWith("2")) {
+            const info = HTTPClient.parseInfo(res.text);
+            UI.setInstanceInfo(url, info);
+            Log.instance("Instance available and responding");
+          } else {
+            UI.setInstanceError(url, `http:${res.status}`);
+            Log.instance(`Instance returned status ${res.status}`, "warn");
+          }
+        } catch (e) {
+          Log.instance(`Failed to fetch instance info: ${e.message}`, "warn");
+          UI.setInstanceError(url, e.message);
         }
-      } catch (e) {
-        Log.warn(`device:info-failed:${e.message}`);
-        UI.setDeviceError(url, e.message);
       }
 
       App.ws.connect();
@@ -973,7 +936,7 @@
         case "uptime": {
           const info = {};
           info[key] = val;
-          UI.setDeviceInfo(App.state.serverUrl, info);
+          UI.setInstanceInfo(App.state.serverUrl, info);
           break;
         }
         case "log":
@@ -992,8 +955,8 @@
     },
   };
 
-  // Instantiate WS client
-  App.ws = new WSClient({
+  // Instantiate Connection client (supports WebSocket and Socket.IO)
+  App.ws = new ConnectionClient({
     getUrl: () => App.state.serverUrl,
     getDelay: () => App.state.reconnectDelay,
     onOpen: () => {
@@ -1008,7 +971,7 @@
     onMessage: (txt) => App.handleWSMessage(txt),
     onError: (ev) => {
       UI.setStatus("err", "Error");
-      Toast.err("WebSocket error");
+      Toast.err("Connection error");
     },
   });
 
@@ -1026,17 +989,24 @@
       ctx.ws.send("hello:world");
     });
 
-    // Wire device availability polling (optional)
+    // Example: Use countdown effect for custom action
+    // Actions.define("custom:countdown-demo", async (ctx) => {
+    //   await Countdown.show(UI.elements.countdown, () => {
+    //     Toast.ok("Countdown complete!");
+    //   });
+    // });
+
+    // Wire instance availability polling (optional)
     setInterval(async () => {
       const url = App.state.serverUrl;
       if (!url) return;
       try {
         const { status } = await HTTPClient.get(url, "/info");
         if (!String(status).startsWith("2")) {
-          UI.setDeviceError(url, `http:${status}`);
+          UI.setInstanceError(url, `http:${status}`);
         }
       } catch (e) {
-        UI.setDeviceError(url, e.message);
+        UI.setInstanceError(url, e.message);
       }
     }, 15000);
   });
@@ -1054,6 +1024,7 @@
     Log,
     Storage,
     HTTPClient,
+    Countdown,
     App,
   };
 })();
