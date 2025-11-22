@@ -230,12 +230,36 @@
       white-space: pre-wrap; word-break: break-word;
     }
     .logline:hover { background: rgba(255,255,255,0.02); }
+    .log--rx { background: rgba(34, 211, 238, 0.03); }
+    .log--tx { background: rgba(124, 58, 237, 0.03); }
+    .log--err { background: rgba(239, 68, 68, 0.03); }
+    .log--warn { background: rgba(245, 158, 11, 0.03); }
     .logline__ts { color: var(--muted); }
-    .logline__msg {}
+    .logline__msg { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .logline__tag { text-align: right; color: var(--muted); }
     .log--ok .logline__tag { color: var(--ok); }
     .log--warn .logline__tag { color: var(--warn); }
     .log--err .logline__tag { color: var(--err); }
+    .log--rx .logline__tag { color: var(--accent-2); }
+    .log--tx .logline__tag { color: var(--accent); }
+    
+    /* Log badges for RX/TX */
+    .log-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    .log-badge--rx {
+      background: rgba(34, 211, 238, 0.15);
+      color: var(--accent-2);
+      border: 1px solid rgba(34, 211, 238, 0.3);
+    }
+    .log-badge--tx {
+      background: rgba(124, 58, 237, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(124, 58, 237, 0.3);
+    }
+    
     .sticky-tools {
       position: sticky; top: 0; z-index: 2;
       display: flex; align-items: center; gap: 8px; padding: 8px;
@@ -286,6 +310,13 @@
       20% { opacity: 1; transform: translateY(0) scale(1.02); }
       100% { opacity: 0; transform: translateY(40px) scale(0.92); }
     }
+
+    /* =============== INSTANCE INFO TABLE =============== */
+    .kv {
+      display: grid; grid-template-columns: 140px 1fr; gap: 8px 14px; font-family: var(--mono); font-size: 13px;
+    }
+    .kv__k { color: var(--muted); }
+    .kv__v { color: var(--text); overflow-wrap: anywhere; }
 
     /* =============== FOOTER =============== */
     .footer {
@@ -419,6 +450,13 @@
 
         <div class="grid-2">
           <div class="field">
+            <label class="label" for="instanceList">Connected Instances</label>
+            <select id="instanceList" class="select" aria-describedby="instanceListHint" oninput="AppUI.validateInput(event)">
+              <!-- Populated from storage and /info names -->
+            </select>
+            <div class="hint" id="instanceListHint">Instance names come from /info. Errors are indicated inline.</div>
+          </div>
+          <div class="field">
             <label class="label" for="reconnectDelay">Reconnect Delay (ms)</label>
             <input
               id="reconnectDelay"
@@ -435,11 +473,32 @@
           </div>
         </div>
 
+        <div class="card">
+          <div class="card__head">
+            <div class="card__title">Connected Instance</div>
+            <div class="chip">
+              <svg class="icon"><use href="#i-check"></use></svg>
+              <span id="instanceStateChip">No instance</span>
+            </div>
+          </div>
+          <div class="card__body">
+            <div class="kv" id="instanceInfo">
+              <div class="kv__k">Host</div><div class="kv__v" data-k="host">—</div>
+              <div class="kv__k">Name</div><div class="kv__v" data-k="name">—</div>
+              <div class="kv__k">Firmware</div><div class="kv__v" data-k="firmware">—</div>
+              <div class="kv__k">Uptime</div><div class="kv__v" data-k="uptime">—</div>
+            </div>
+          </div>
+        </div>
+
         <div class="actions">
           <div class="label">Actions</div>
           <div class="action-grid" id="actionsGrid">
             <button class="action" data-action="ws:send" data-message="ping:1">
               <svg class="icon"><use href="#i-send"></use></svg> <span>Ping</span>
+            </button>
+            <button class="action" data-action="http:get" data-path="/info">
+              <svg class="icon"><use href="#i-refresh"></use></svg> <span>Fetch /info</span>
             </button>
             <button class="action" data-action="app:clear-logs">
               <svg class="icon"><use href="#i-trash"></use></svg> <span>Clear Logs</span>
@@ -451,9 +510,8 @@
               <svg class="icon"><use href="#i-auto"></use></svg> <span>Toggle Auto</span>
             </button>
             <button class="action" data-action="ws:send" data-message="status:1">
-              <svg class="icon"><use href="#i-check"></use></svg> <span>Get Status</span>
+              <svg class="icon"><use href="#i-type"></use></svg> <span>Get Status</span>
             </button>
-            <button class="action" data-action="ws:send" data-message="info:1">
               <svg class="icon"><use href="#i-type"></use></svg> <span>Get Info</span>
             </button>
           </div>

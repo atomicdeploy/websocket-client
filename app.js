@@ -63,7 +63,7 @@
       downloadBtn: qs("#downloadLogsBtn"),
     };
 
-    let filter = "all"; // all | ok | warn | err
+    let filter = "all"; // all | ok | warn | err | rx | tx
     let counters = { rx: 0, tx: 0, err: 0 };
     /** Public API */
     const api = {
@@ -81,12 +81,12 @@
       rx(msg) {
         counters.rx++;
         updateCounters();
-        append("ok", `rx:${msg}`);
+        append("rx", msg);
       },
       tx(msg) {
         counters.tx++;
         updateCounters();
-        append("ok", `tx:${msg}`);
+        append("tx", msg);
       },
       raw(line, level = "ok") {
         append(level, line);
@@ -119,9 +119,18 @@
     function append(level, msg) {
       const line = document.createElement("div");
       line.className = `logline log--${level}`;
+      
+      // Create badge for rx/tx, regular tag for others
+      let badge = "";
+      if (level === "rx") {
+        badge = '<span class="log-badge log-badge--rx">RX</span>';
+      } else if (level === "tx") {
+        badge = '<span class="log-badge log-badge--tx">TX</span>';
+      }
+      
       line.innerHTML = `
         <div class="logline__ts">${fmtTime()}</div>
-        <div class="logline__msg">${escapeHTML(String(msg))}</div>
+        <div class="logline__msg">${badge}${escapeHTML(String(msg))}</div>
         <div class="logline__tag">${tagName(level)}</div>
       `;
       el.body.appendChild(line);
@@ -146,6 +155,8 @@
       if (level === "ok") return "info";
       if (level === "warn") return "warn";
       if (level === "err") return "error";
+      if (level === "rx") return "recv";
+      if (level === "tx") return "sent";
       return level;
     }
 
@@ -215,7 +226,44 @@
     };
   })();
 
-
+  /*****************************
+   * HTTP Client (reusable for fetching instance info)
+   *****************************/
+  const HTTPClient = {
+    async get(url, path = "/") {
+      const httpUrl = toHttpBase(url) + path;
+      Log.info(`http:get:${httpUrl}`);
+      const r = await fetch(httpUrl, { cache: "no-store" });
+      const txt = await r.text();
+      Log.info(`http:status:${r.status}`);
+      return { status: r.status, text: txt };
+    },
+    parseInfo(text) {
+      const info = {};
+      text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .forEach((line) => {
+          const idx = line.indexOf(":");
+          if (idx > -1) {
+            const k = line.slice(0, idx).trim().toLowerCase();
+            const v = line.slice(idx + 1).trim();
+            info[k] = v;
+          }
+        });
+      return info;
+    },
+  };
+  function toHttpBase(wsUrl) {
+    try {
+      const u = new URL(wsUrl);
+      const proto = u.protocol === "wss:" ? "https:" : "http:";
+      return `${proto}//${u.host}`;
+    } catch {
+      return wsUrl;
+    }
+  }
 
   /*****************************
    * WS Client (auto reconnect)
@@ -330,6 +378,16 @@
       ctx.ws.send(msg);
     });
 
+    define("http:get", async (ctx, el) => {
+      const path = el?.getAttribute("data-path") || "/";
+      const { status, text } = await HTTPClient.get(ctx.url(), path);
+      Log.info(`http:body:${text.slice(0, 500)}${text.length > 500 ? "…" : ""}`);
+      if (path === "/info") {
+        const info = HTTPClient.parseInfo(text);
+        UI.setInstanceInfo(ctx.url(), info);
+      }
+    });
+
     define("app:clear-logs", () => Log.clear());
 
     define("app:reconnect", (ctx) => {
@@ -363,9 +421,12 @@
       serverUrl: qs("#serverUrl"),
       saveServerBtn: qs("#saveServerBtn"),
       recentServers: qs("#recentServers"),
+      instanceList: qs("#instanceList"),
       autoConnect: qs("#autoConnect"),
       autoReconnect: qs("#autoReconnect"),
       reconnectDelay: qs("#reconnectDelay"),
+      instanceInfo: qs("#instanceInfo"),
+      instanceStateChip: qs("#instanceStateChip"),
       actionsGrid: qs("#actionsGrid"),
       countdown: qs("#countdown"),
     };
@@ -401,6 +462,16 @@
         App.persist();
       });
 
+      // Instance dropdown
+      el.instanceList.addEventListener("input", () => {
+        const url = el.instanceList.value;
+        if (url) {
+          el.serverUrl.value = url;
+          App.state.serverUrl = url;
+          App.persist();
+        }
+      });
+
       // Actions grid
       el.actionsGrid.addEventListener("click", (e) => {
         const btn = e.target.closest(".action");
@@ -412,6 +483,7 @@
       // Live validation hooks are provided by AppUI.validateInput
       populateFromState();
       populateHistory();
+      populateInstances();
 
       // Auto-connect if requested
       if (App.state.autoConnect && App.state.serverUrl) {
@@ -430,6 +502,18 @@
     function populateHistory() {
       const recent = Storage.get("recentServers", []);
       el.recentServers.innerHTML = recent.map((u) => `<option value="${escapeHTML(u)}">`).join("");
+    }
+
+    function populateInstances() {
+      const instances = Storage.get("instances", []); // [{url,name,lastError}]
+      el.instanceList.innerHTML = "";
+      instances.forEach((d) => {
+        const o = document.createElement("option");
+        o.value = d.url;
+        o.textContent = d.name ? `${d.name} — ${d.url}` : d.url;
+        if (d.lastError) o.textContent += ` (err)`;
+        el.instanceList.appendChild(o);
+      });
     }
 
     function setStatus(kind, text) {
@@ -460,7 +544,35 @@
         Storage.set("recentServers", recent);
         populateHistory();
       }
+      addOrUpdateInstance(url, { name: "", lastError: "" });
+      populateInstances();
       Toast.ok("Saved to history");
+    }
+
+    function addOrUpdateInstance(url, { name, lastError }) {
+      const instances = Storage.get("instances", []);
+      const i = instances.findIndex((d) => d.url === url);
+      if (i === -1) instances.push({ url, name: name || "", lastError: lastError || "" });
+      else {
+        if (name !== undefined) instances[i].name = name;
+        if (lastError !== undefined) instances[i].lastError = lastError;
+      }
+      Storage.set("instances", instances);
+    }
+
+    function setInstanceInfo(url, info) {
+      qs('[data-k="host"]', el.instanceInfo).textContent = new URL(url).host;
+      qs('[data-k="name"]', el.instanceInfo).textContent = info.name || "—";
+      qs('[data-k="firmware"]', el.instanceInfo).textContent = info.firmware || "—";
+      qs('[data-k="uptime"]', el.instanceInfo).textContent = info.uptime || "—";
+      el.instanceStateChip.textContent = info.name ? `${info.name}` : "Instance";
+      addOrUpdateInstance(url, { name: info.name || "", lastError: "" });
+      populateInstances();
+    }
+
+    function setInstanceError(url, errText) {
+      addOrUpdateInstance(url, { lastError: errText || "error" });
+      populateInstances();
     }
 
     function updateButtons(connected) {
@@ -472,11 +584,19 @@
       el.autoReconnect.checked = !!App.state.autoReconnect;
     }
 
+    function clearInstanceInfo() {
+      qsa(".kv__v", el.instanceInfo).forEach((n) => (n.textContent = "—"));
+      el.instanceStateChip.textContent = "No instance";
+    }
+
     return {
       init,
       setStatus,
       updateButtons,
       updateAutoToggle,
+      setInstanceInfo,
+      setInstanceError,
+      clearInstanceInfo,
       elements: el,
     };
   })();
@@ -575,6 +695,23 @@
       App.persist();
       UI.updateButtons(true);
       UI.setStatus("warn", "Connecting…");
+      UI.clearInstanceInfo();
+
+      // Check availability via /info first
+      try {
+        const res = await HTTPClient.get(url, "/info");
+        if (String(res.status).startsWith("2")) {
+          const info = HTTPClient.parseInfo(res.text);
+          UI.setInstanceInfo(url, info);
+          Log.info("instance:available");
+        } else {
+          UI.setInstanceError(url, `http:${res.status}`);
+          Log.warn(`instance:info-status:${res.status}`);
+        }
+      } catch (e) {
+        Log.warn(`instance:info-failed:${e.message}`);
+        UI.setInstanceError(url, e.message);
+      }
 
       App.ws.connect();
     },
@@ -595,6 +732,14 @@
 
       // Built-in handlers (example)
       switch (key) {
+        case "name":
+        case "firmware":
+        case "uptime": {
+          const info = {};
+          info[key] = val;
+          UI.setInstanceInfo(App.state.serverUrl, info);
+          break;
+        }
         case "log":
           Log.info(val);
           break;
@@ -651,6 +796,20 @@
     //     Toast.ok("Countdown complete!");
     //   });
     // });
+
+    // Wire instance availability polling (optional)
+    setInterval(async () => {
+      const url = App.state.serverUrl;
+      if (!url) return;
+      try {
+        const { status } = await HTTPClient.get(url, "/info");
+        if (!String(status).startsWith("2")) {
+          UI.setInstanceError(url, `http:${status}`);
+        }
+      } catch (e) {
+        UI.setInstanceError(url, e.message);
+      }
+    }, 15000);
   });
 
   /*****************************
@@ -665,6 +824,7 @@
     Actions,
     Log,
     Storage,
+    HTTPClient,
     Countdown,
     App,
   };
