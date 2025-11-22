@@ -294,9 +294,9 @@
   }
 
   /*****************************
-   * WS Client (auto reconnect)
+   * Unified Connection Client (WebSocket + Socket.IO)
    *****************************/
-  class WSClient {
+  class ConnectionClient {
     constructor({ onOpen, onClose, onMessage, onError, getUrl, getDelay }) {
       this.onOpen = onOpen;
       this.onClose = onClose;
@@ -304,23 +304,47 @@
       this.onError = onError;
       this.getUrl = getUrl;
       this.getDelay = getDelay;
-      this.ws = null;
+      this.connection = null;
+      this.connectionType = null; // 'websocket' or 'socketio'
       this._reconnectTimer = null;
       this._manualClose = false;
       this._attempt = 0;
     }
+
+    _detectConnectionType(url) {
+      // Auto-detect: if URL contains 'socket.io' or uses HTTP/HTTPS, prefer Socket.IO
+      // Otherwise use native WebSocket
+      const lowerUrl = url.toLowerCase();
+      if (lowerUrl.includes('socket.io') || lowerUrl.startsWith('http://') || lowerUrl.startsWith('https://')) {
+        return 'socketio';
+      }
+      return 'websocket';
+    }
+
     connect() {
       const url = this.getUrl();
       if (!url) return Log.ws("No URL configured", "warn");
       this._manualClose = false;
+      
+      // Detect connection type
+      this.connectionType = this._detectConnectionType(url);
+      
+      if (this.connectionType === 'socketio') {
+        this._connectSocketIO(url);
+      } else {
+        this._connectWebSocket(url);
+      }
+    }
+
+    _connectWebSocket(url) {
       try {
-        Log.ws(`Connecting to ${url}`);
+        Log.ws(`Connecting via WebSocket to ${url}`);
         const ws = new WebSocket(url);
-        this.ws = ws;
+        this.connection = ws;
 
         ws.addEventListener("open", () => {
           this._attempt = 0;
-          Log.ws(`Connected to ${url}`);
+          Log.ws(`Connected via WebSocket to ${url}`);
           this.onOpen?.();
         });
 
@@ -347,6 +371,81 @@
         this.scheduleReconnect();
       }
     }
+
+    _connectSocketIO(url) {
+      try {
+        // Convert ws:// or wss:// URLs to http:// or https://
+        let ioUrl = url;
+        if (url.startsWith('ws://')) {
+          ioUrl = url.replace('ws://', 'http://');
+        } else if (url.startsWith('wss://')) {
+          ioUrl = url.replace('wss://', 'https://');
+        }
+        
+        // Remove any path like /ws from the URL for Socket.IO
+        const urlObj = new URL(ioUrl);
+        const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
+        
+        Log.ws(`Connecting via Socket.IO to ${baseUrl}`);
+        
+        // Check if Socket.IO is loaded
+        if (typeof io === 'undefined') {
+          Log.ws("Socket.IO library not loaded", "error");
+          return;
+        }
+        
+        const socket = io(baseUrl, {
+          reconnection: false, // We handle reconnection manually
+          transports: ['websocket', 'polling'] // Try websocket first, fallback to polling
+        });
+        this.connection = socket;
+
+        socket.on("connect", () => {
+          this._attempt = 0;
+          Log.ws(`Connected via Socket.IO to ${baseUrl}`);
+          this.onOpen?.();
+        });
+
+        socket.on("message", (data) => {
+          const text = typeof data === 'string' ? data : JSON.stringify(data);
+          Log.rx(text);
+          this.onMessage?.(text);
+        });
+
+        // Listen for any custom events as well
+        socket.onAny((eventName, ...args) => {
+          if (eventName !== 'connect' && eventName !== 'disconnect' && eventName !== 'message') {
+            const text = JSON.stringify({ event: eventName, data: args });
+            Log.rx(text);
+            this.onMessage?.(text);
+          }
+        });
+
+        socket.on("error", (err) => {
+          Log.ws(`Error: ${err.message || "unknown"}`, "error");
+          this.onError?.(err);
+        });
+
+        socket.on("disconnect", (reason) => {
+          Log.ws(`Disconnected (reason: ${reason})`, "warn");
+          this.onClose?.({ reason });
+          if (!this._manualClose && App.state.autoReconnect) {
+            this.scheduleReconnect();
+          }
+        });
+
+        socket.on("connect_error", (err) => {
+          Log.ws(`Connection error: ${err.message}`, "error");
+          if (!this._manualClose && App.state.autoReconnect) {
+            this.scheduleReconnect();
+          }
+        });
+      } catch (e) {
+        Log.ws(`Connection failed: ${e.message}`, "error");
+        this.scheduleReconnect();
+      }
+    }
+
     scheduleReconnect() {
       clearTimeout(this._reconnectTimer);
       const base = Number(App.state.reconnectDelay) || 1500;
@@ -357,26 +456,70 @@
       Log.ws(`Reconnecting in ${Math.round(delay)}ms`, "warn");
       this._reconnectTimer = setTimeout(() => this.connect(), delay);
     }
+
     disconnect() {
       this._manualClose = true;
       clearTimeout(this._reconnectTimer);
-      if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-        this.ws.close(1000, "client-close");
+      
+      if (this.connection) {
+        if (this.connectionType === 'socketio') {
+          this.connection.disconnect();
+        } else if (this.connectionType === 'websocket') {
+          if (this.connection.readyState === WebSocket.OPEN || this.connection.readyState === WebSocket.CONNECTING) {
+            this.connection.close(1000, "client-close");
+          }
+        }
       }
-      this.ws = null;
+      this.connection = null;
     }
+
     send(text) {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(text);
-        Log.tx(text);
-        return true;
-      } else {
-        Log.ws("Send failed: connection not open", "warn");
+      if (!this.connection) {
+        Log.ws("Send failed: not connected", "warn");
         return false;
       }
+
+      if (this.connectionType === 'socketio') {
+        if (this.connection.connected) {
+          // Try to parse as JSON to send as object, otherwise send as message event
+          try {
+            const data = JSON.parse(text);
+            if (data.event) {
+              // If message has event field, emit that event
+              this.connection.emit(data.event, data.data || data);
+            } else {
+              this.connection.emit('message', text);
+            }
+          } catch {
+            this.connection.emit('message', text);
+          }
+          Log.tx(text);
+          return true;
+        } else {
+          Log.ws("Send failed: Socket.IO not connected", "warn");
+          return false;
+        }
+      } else if (this.connectionType === 'websocket') {
+        if (this.connection.readyState === WebSocket.OPEN) {
+          this.connection.send(text);
+          Log.tx(text);
+          return true;
+        } else {
+          Log.ws("Send failed: connection not open", "warn");
+          return false;
+        }
+      }
+      return false;
     }
+
     isOpen() {
-      return this.ws?.readyState === WebSocket.OPEN;
+      if (!this.connection) return false;
+      if (this.connectionType === 'socketio') {
+        return this.connection.connected;
+      } else if (this.connectionType === 'websocket') {
+        return this.connection.readyState === WebSocket.OPEN;
+      }
+      return false;
     }
   }
 
@@ -638,7 +781,7 @@
    *****************************/
   const Validators = {
     url(v) {
-      return /^wss?:\/\/([^\s:\/]+)(:\d+)?(\/[^\s]*)?$/.test(v);
+      return /^(wss?|https?):\/\/([^\s:\/]+)(:\d+)?(\/[^\s]*)?$/.test(v);
     },
     numberIn(v, min, max) {
       const n = Number(v);
@@ -788,8 +931,8 @@
     },
   };
 
-  // Instantiate WS client
-  App.ws = new WSClient({
+  // Instantiate Connection client (supports WebSocket and Socket.IO)
+  App.ws = new ConnectionClient({
     getUrl: () => App.state.serverUrl,
     getDelay: () => App.state.reconnectDelay,
     onOpen: () => {
@@ -804,7 +947,7 @@
     onMessage: (txt) => App.handleWSMessage(txt),
     onError: (ev) => {
       UI.setStatus("err", "Error");
-      Toast.err("WebSocket error");
+      Toast.err("Connection error");
     },
   });
 
