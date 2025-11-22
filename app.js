@@ -312,13 +312,26 @@
     }
 
     _detectConnectionType(url) {
-      // Auto-detect: if URL contains 'socket.io' or uses HTTP/HTTPS, prefer Socket.IO
-      // Otherwise use native WebSocket
-      const lowerUrl = url.toLowerCase();
-      if (lowerUrl.includes('socket.io') || lowerUrl.startsWith('http://') || lowerUrl.startsWith('https://')) {
-        return 'socketio';
+      // Auto-detect: if URL uses HTTP/HTTPS, use Socket.IO
+      // Otherwise use native WebSocket for ws:// and wss://
+      try {
+        const urlObj = new URL(url);
+        const protocol = urlObj.protocol;
+        
+        // Check protocol: http/https → Socket.IO, ws/wss → WebSocket
+        if (protocol === 'http:' || protocol === 'https:') {
+          return 'socketio';
+        } else if (protocol === 'ws:' || protocol === 'wss:') {
+          return 'websocket';
+        }
+        
+        // Default to websocket for unknown protocols
+        return 'websocket';
+      } catch (e) {
+        // If URL parsing fails, default to websocket
+        Log.ws(`Failed to parse URL, defaulting to WebSocket: ${e.message}`, "warn");
+        return 'websocket';
       }
-      return 'websocket';
     }
 
     connect() {
