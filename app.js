@@ -407,6 +407,7 @@
         });
 
         socket.on("message", (data) => {
+          // Standard message event - keep original format
           const text = typeof data === 'string' ? data : JSON.stringify(data);
           Log.rx(text);
           this.onMessage?.(text);
@@ -414,10 +415,17 @@
 
         // Listen for any custom events as well
         socket.onAny((eventName, ...args) => {
-          if (eventName !== 'connect' && eventName !== 'disconnect' && eventName !== 'message') {
-            const text = JSON.stringify({ event: eventName, data: args });
-            Log.rx(text);
-            this.onMessage?.(text);
+          if (eventName !== 'connect' && eventName !== 'disconnect' && eventName !== 'message' && eventName !== 'error' && eventName !== 'connect_error') {
+            // For custom events, we need to indicate the event name somehow
+            // Send as-is if single string argument, otherwise wrap with event info
+            if (args.length === 1 && typeof args[0] === 'string') {
+              Log.rx(args[0]);
+              this.onMessage?.(args[0]);
+            } else {
+              const text = JSON.stringify({ event: eventName, data: args });
+              Log.rx(text);
+              this.onMessage?.(text);
+            }
           }
         });
 
@@ -864,7 +872,7 @@
       const url = UI.elements.serverUrl.value.trim();
       if (!Validators.url(url)) {
         AppUI.markInvalid(UI.elements.serverUrl, "serverUrlErr", true);
-        return Toast.err("Enter a valid WebSocket URL.");
+        return Toast.err("Enter a valid URL (WebSocket or Socket.IO)");
       }
       App.state.serverUrl = url;
       App.persist();
@@ -872,20 +880,23 @@
       UI.setStatus("warn", "Connecting…");
       UI.clearInstanceInfo();
 
-      // Check availability via /info first
-      try {
-        const res = await HTTPClient.get(url, "/info");
-        if (String(res.status).startsWith("2")) {
-          const info = HTTPClient.parseInfo(res.text);
-          UI.setInstanceInfo(url, info);
-          Log.instance("Instance available and responding");
-        } else {
-          UI.setInstanceError(url, `http:${res.status}`);
-          Log.instance(`Instance returned status ${res.status}`, "warn");
+      // Check availability via /info only for WebSocket URLs
+      // Socket.IO servers may not have this endpoint
+      if (url.startsWith('ws://') || url.startsWith('wss://')) {
+        try {
+          const res = await HTTPClient.get(url, "/info");
+          if (String(res.status).startsWith("2")) {
+            const info = HTTPClient.parseInfo(res.text);
+            UI.setInstanceInfo(url, info);
+            Log.instance("Instance available and responding");
+          } else {
+            UI.setInstanceError(url, `http:${res.status}`);
+            Log.instance(`Instance returned status ${res.status}`, "warn");
+          }
+        } catch (e) {
+          Log.instance(`Failed to fetch instance info: ${e.message}`, "warn");
+          UI.setInstanceError(url, e.message);
         }
-      } catch (e) {
-        Log.instance(`Failed to fetch instance info: ${e.message}`, "warn");
-        UI.setInstanceError(url, e.message);
       }
 
       App.ws.connect();
